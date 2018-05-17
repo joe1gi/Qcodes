@@ -1,12 +1,21 @@
-import numpy as np
+import time
 
+import numpy as np
 from qcodes import (
     ArrayParameter, InstrumentChannel, VisaInstrument, validators as vals,
     DataArray
 )
 
+# get_parser shorthands
+def qstr(s):
+    '''convert quoted string to string. just strips the quotes currently.'''
+    return s[1:-1]
+def ibool(v):
+    '''convert str -> int -> bool'''
+    return bool(int(v))
+
 class DPOCurve(ArrayParameter):
-    def __init__(self, name, source, **kwargs):
+    def __init__(self, name, source, command='CURVE', **kwargs):
         '''
         Input
         -----
@@ -17,9 +26,15 @@ class DPOCurve(ArrayParameter):
         source: `str`
             Channel, math or reference waveform to retrieve.
             One of CH<x>, MATH<x>, REF<x>, DIGITALALL.
+
+        To do
+        -----
+        * Point format can be Y or ENVelope. ENVelope should be returned as a
+          MultiParameter with min and max arrays instead.
         '''
         super().__init__(name, shape=(), **kwargs)
         self.source = source
+        self.command = command
 
     def preamble(self):
         '''
@@ -27,18 +42,19 @@ class DPOCurve(ArrayParameter):
         '''
         preamble_keys_parsers = list(zip(*[
             ('BYT_NR', int), ('BIT_NR', int), ('ENCDG', str), ('BN_FMT', str),
-            ('BYT_OR', str), ('WFID', str), ('NR_PT', int), ('PT_FMT', str),
-            ('XUNIT', str), ('XINCR', float), ('XZERO', float), ('PT_OFF', int), 
-            ('YUNIT', str), ('YMULT', float), ('YOFF', float), ('YZERO', float), 
-            ('NR_FR', int), ('PT_OR', str), ('FASTFRAME', int)
+            ('BYT_OR', str), ('WFID', qstr), ('NR_PT', int), ('PT_FMT', str),
+            ('XUNIT', qstr), ('XINCR', float), ('XZERO', float), ('PT_OFF', int), 
+            ('YUNIT', qstr), ('YMULT', float), ('YOFF', float), ('YZERO', float), 
+            ('NR_FR', int), ('PT_OR', str), ('FASTFRAME', int), ('SUMFRAME', str)
         ]))
         preamble_vals = self._instrument.ask(
-            ':DATA:SOURCE {}; :WFMO?; :WFMO:PT_OR?; :HOR:FAST:STATE?'
-            .format(self.source)
+            ':DATA:SOURCE {}; '.format(self.source) + 
+            ':WFMO?; :WFMO:PT_OR?; '
+            ':HOR:FAST:STATE?; SUMFRAME?'
         )
         preamble = dict((key, parser(value)) for value, key, parser 
                         in zip(preamble_vals.split(';'), *preamble_keys_parsers))
-        preamble['FASTACQ'] = (preamble['PT_OR'] == 'COLUMN')
+        preamble['PIXMAP'] = (preamble['PT_OR'] == 'COLUMN')
         return preamble
 
     def update(self, force=False, preamble=None):
@@ -69,34 +85,25 @@ class DPOCurve(ArrayParameter):
         self.label = pre['WFID']
         self.unit = pre['YUNIT']
         # determine setpoints
-        npoints = 1000-1 if pre['FASTACQ'] else pre['NR_PT']
-        nframes = 1 if not pre['FASTFRAME'] else pre['NR_FR']
+        npoints = 1000 if pre['PIXMAP'] else pre['NR_PT']
         sp_times = DataArray(
             name='X', unit=pre['XUNIT'], is_setpoint=True, 
             preset_data=pre['XZERO'] + pre['XINCR']*np.arange(npoints)
         )
-        if (nframes < 2):
+        if not pre['FASTFRAME']:
             # output is 1d if FastFrame is disabled
             self.shape = (npoints,)
-            self._setpoints = (sp_times,)
+            self.setpoints = (sp_times,)
         else:
             # output is 2d if FastFrame is enabled
+            nframes = pre['NR_FR']
             self.shape = (nframes, npoints)
             sp_frames = DataArray(
                 name='frame', unit='', is_setpoint=True, 
                 preset_data=np.arange(nframes)
             )
             sp_times.nest(len(sp_frames))
-            self._setpoints = (sp_frames, sp_times)
-
-    @property
-    def setpoints(self):
-        self.update()
-        return self._setpoints
-
-    @setpoints.setter
-    def setpoints(self, value):
-        self._setpoints = value
+            self.setpoints = (sp_frames, sp_times)
 
     def prepare(self, data_start=1, data_stop=(1<<31)-1, frame_start=1, 
                 frame_stop=(1<<31)-1):
@@ -114,24 +121,14 @@ class DPOCurve(ArrayParameter):
             First and last frame to transfer in FastFrame mode
         '''
         # set data source and range
-        self._instrument.write('DATA:SOURCE {}'.format(self.source))
-        self._instrument.write('DATA:START {}'.format(data_start))
-        self._instrument.write('DATA:STOP {}'.format(data_stop))
-        self._instrument.write('DATA:FRAMESTART {}'.format(frame_start))
-        self._instrument.write('DATA:FRAMESTOP {}'.format(frame_stop))
-        # set data encoding
-        # * ASCII in fast and wfmdb modes (data corruption happens otherwise)
-        # * FASTEST otherwise, which is int or float depending on source
-        # * default width is 8bit, increase to 16bit when averaging is used
-        pre = self.preamble()
-        if pre['FASTACQ']:
-            cmd = 'DATA:ENC ASCII'
-        elif 'Average mode' in pre['WFID']:
-            cmd = 'DATA:ENC FASTEST; :WFMO:BYT_NR 2'
-        else:
-            cmd = 'DATA:ENC FASTEST; :WFMO:BYT_NR 1'
-        self._instrument.write(cmd)
-        self.update(preamble=pre)
+        self._instrument.write('; '.join((
+            'DATA:SOURCE {}'.format(self.source),
+            'START {}'.format(data_start),
+            'STOP {}'.format(data_stop),
+            'FRAMESTART {}'.format(frame_start),
+            'FRAMESTOP {}'.format(frame_stop)
+        )))
+        self.update()
 
     def get_raw(self, raw=False):
         '''
@@ -141,16 +138,30 @@ class DPOCurve(ArrayParameter):
         * acq_mode==peakdetect, envelope: 0::2 and 1::2 are min/max
         * acq_mode==wfmdb: requires scale=False
         '''
-        # get current waveform preamble
+        # check and set data encoding
+        # * ASCII in fast and wfmdb modes (data corruption happens otherwise)
+        # * FASTEST otherwise, which is int or float depending on source
+        # * default width is 8bit, increase to 16bit when
+        #   * acquisition mode average is used
+        #   * fast frame with an averaged summary frame is used
         pre = self.preamble()
+        if pre['PIXMAP']:
+            if pre['ENCDG'] != 'ASC':
+                self._instrument.write('DATA:ENC ASCII')
+                pre = self.preamble()
+        else:
+            byt_nr = 2 if (('Average mode' in pre['WFID']) or \
+                           pre['FASTFRAME'] and (pre['SUMFRAME'] == 'AVE')) else \
+                     1
+            if (
+                (pre['ENCDG'] != 'BIN') or
+                (pre['BN_FMT'] != 'FP') and (pre['BYT_NR'] != byt_nr)
+            ):
+                self._instrument.write('DATA:ENC FASTEST; :WFMO:BYT_NR {}'
+                                       .format(byt_nr))
+                pre = self.preamble()
+        # update setpoints etc.
         self.update(preamble=pre)
-        # switch to ASCII transfers in fast acquisitions mode
-        if pre['FASTACQ'] and (pre['ENCDG'] == 'BIN'):
-            # Change data encoding to ASCII because
-            # * The data is corrupted when choosing binary mode
-            # * It is faster for clean waveforms ('0' is 2 bytes instead of 8)
-            self._instrument.write('WFMO:ENC ASCII')
-            pre['ENCDG'] = 'ASC'
         # get raw data from device
         if pre['ENCDG'] == 'BIN':
             #order = dict('MSB':'>', 'LSB':'<')[pre['BYT_OR']]
@@ -158,26 +169,24 @@ class DPOCurve(ArrayParameter):
                      'RP':{1:'B', 2:'H', 4:'I', 8:'Q'}[pre['BYT_NR']], 
                      'FP':'f'}[pre['BN_FMT']]
             data = self._instrument._parent.visa_handle.query_binary_values(
-                'CURVE?', datatype=dtype, is_big_endian=(pre['BYT_OR']=='MSB'),
-                container=np.array
+                self.command+'?', datatype=dtype, container=np.array, 
+                is_big_endian=(pre['BYT_OR']=='MSB'),
             )
         elif pre['ENCDG'] == 'ASC':
-            converter = float if pre['BN_FMT'] == 'fp' else int
+            converter = float if (pre['BN_FMT'] == 'FP') else int
             data = self._instrument._parent.visa_handle.query_ascii_values(
-                'CURVE?', converter=converter, container=np.array
+                self.command+'?', converter=converter, container=np.array
             )
         else:
             raise ValueError('Invalid encoding {}.'.format(pre['ENCDG']))
         # process data
         if not raw:
-            if pre['FASTACQ']:
+            if pre['PIXMAP']:
                 # calculate mean value of the histogram in fast acquisitions 
                 # and wfmdb modes -- use DPOPixmap to get the counts instead
-                # pixmap is 1000 points times 252 bins, but last point never 
-                # has any counts, so we are discarding it here
+                # pixmap is 1000 points times 252 bins
                 data.shape = (1000, 252)
-                data = data[:-1,:]
-                ys = pre['YZERO'] + pre['YMULT']*(np.arange(252)+pre['YOFF'])
+                ys = pre['YZERO'] + pre['YMULT']*(np.arange(252)-pre['YOFF'])
                 data = (data * ys[None,:]).sum(1) / data.sum(1)
             else:
                 # in all other modes shift and scale the data
@@ -191,12 +200,15 @@ class DPOPixmap(DPOCurve):
         '''
         Prepare pixmap for data acquisition.
 
-        Sets up shape and setpoints of the parameters.
+        Sets data start/stop on the instrument.
+        Updates shape, label, units and setpoints via update().
         '''
         # set data source and range
-        self._instrument.write('DATA:SOURCE {}'.format(self.source))
-        self._instrument.write('DATA:START {}'.format(1))
-        self._instrument.write('DATA:STOP {}'.format((1<<31)-1))
+        self._instrument.write('; '.join((
+            'DATA:SOURCE {}'.format(self.source),
+            'START {}'.format(1),
+            'STOP {}'.format((1<<31)-1)
+        )))
         self.update()
 
     def _update(self, pre):
@@ -216,10 +228,10 @@ class DPOPixmap(DPOCurve):
         )
         sp_ys = DataArray(
             name='Y', unit=pre['YUNIT'], is_setpoint=True,
-            preset_data=pre['YZERO'] + pre['YMULT']*(np.arange(rows)+pre['YOFF'])
+            preset_data=pre['YZERO'] + pre['YMULT']*(np.arange(rows)-pre['YOFF'])
         )
         sp_ys.nest(len(sp_xs))
-        self._setpoints = (sp_xs, sp_ys)
+        self.setpoints = (sp_xs, sp_ys)
 
     def get_raw(self):
         return super().get_raw(raw=True)
@@ -234,16 +246,22 @@ class DPOChannel(InstrumentChannel):
             'state', label='State',
             get_cmd='SELECT:{}?'.format(source),
             set_cmd='SELECT:{} {}'.format(source, '{:d}'),
-            get_parser=lambda v: bool(int(v)), vals=vals.Bool()
+            get_parser=ibool, vals=vals.Bool()
         )
         self.add_parameter(
             'label', label='Label', 
             get_cmd='{}:LABEL:NAME?'.format(source),
             set_cmd='{}:LABEL:NAME {}'.format(source, '{}'),
-            get_parser=lambda v: v[1:-1], vals=vals.Strings(0, 32)
+            get_parser=qstr, vals=vals.Strings(0, 32)
         )
         # data transfer
         self.add_parameter('curve', DPOCurve, source=source)
+
+    def show(self):
+        self.state.set(True)
+
+    def hide(self):
+        self.state.set(False)
 
 
 class DPOAuxiliaryChannel(InstrumentChannel):
@@ -319,6 +337,10 @@ class DPOAnalogChannel(DPOChannel):
         )
         # data transfer
         self.add_parameter('pixmap', DPOPixmap, source=source)
+        self.add_parameter('curvenext', DPOCurve, source=source, 
+                           command='CURVENEXT')
+        self.add_parameter('pixmapnext', DPOPixmap, source=source, 
+                           command='CURVENEXT')
 
 
 class DPOReferenceChannel(DPOChannel):
@@ -354,9 +376,8 @@ class DPOMathChannel(DPOReferenceChannel):
         self.add_parameter(
             'expression', label='Expression', 
             docstring='Mathematical expression used to calculate the data', 
-            get_cmd='{}:DEFINE?'.format(self.source), 
+            get_cmd='{}:DEFINE?'.format(self.source), get_parser=qstr, 
             set_cmd='{}:DEFINE "{}"'.format(self.source, '{}'),
-            get_parser=lambda s: s[1:-1]
         )
         self.add_parameter(
             'averages', label='Averages',
@@ -367,7 +388,7 @@ class DPOMathChannel(DPOReferenceChannel):
             ''',
             get_cmd='{}:NUMAVG?'.format(self.source),
             set_cmd='{}:NUMAVG {}'.format(self.source, '{:d}'),
-            get_parser=int, vals=vals.Numbers()
+            get_parser=int, vals=vals.Ints(1)
         )
         # display setup
         del self.parameters['hposition']
@@ -394,8 +415,7 @@ class DPOTrigger(InstrumentChannel):
         )
         self.add_parameter(
             'ready', label='Trigger ready state', 
-            get_cmd='TRIG:{}:READY?'.format(channel), 
-            get_parser=lambda v: bool(int(v))
+            get_cmd='TRIG:{}:READY?'.format(channel), get_parser=ibool
         )
         # A trigger only settings
         if channel == 'A':
@@ -420,7 +440,7 @@ class DPOTrigger(InstrumentChannel):
             self.add_parameter(
                 'state',
                 docstring='Is the B trigger is part of the triggering sequence?', 
-                get_cmd='TRIG:B:STATE?', get_parser=lambda v: bool(int(v)),
+                get_cmd='TRIG:B:STATE?', get_parser=ibool,
                 set_cmd='TRIG:B:STATE {:d}', vals=vals.Bool()
             )
             self.add_parameter(
@@ -428,13 +448,13 @@ class DPOTrigger(InstrumentChannel):
                 docstring='Selects whether B trigger occurs after a specified '
                           'number of events or a specified time after A.', 
                 get_cmd='TRIG:B:BY?', set_cmd='TRIG:B:BY {}',
-                val_mapping={'events':'EVENTS', 'time':'TIME'}
+                val_mapping={'events':'EVENTS', 'time':'TIM'}
             )
             self.add_parameter(
                 'events',
                 docstring='Number of B trigger events before acquisition.', 
                 get_cmd='TRIG:B:EVENTS:COUNT?', get_parser=int, 
-                set_cmd='TRIG:B:EVENTS:COUNT {:d}', vals=vals.Numbers(1, 10000000)
+                set_cmd='TRIG:B:EVENTS:COUNT {:d}', vals=vals.Ints(1, 10000000)
             )
             self.add_parameter(
                 'time', unit='s', 
@@ -474,7 +494,7 @@ class Tektronix_DPO70000(VisaInstrument):
         # Acquisition setup
         self.add_parameter(
             'acq_state', label='Acuqisition state',
-            get_cmd='ACQ:STATE?', get_parser=lambda v: bool(int(v)),
+            get_cmd='ACQ:STATE?', get_parser=ibool,
             set_cmd='ACQ:STATE {:d}', vals=vals.Bool()
         )
         self.add_parameter(
@@ -487,16 +507,27 @@ class Tektronix_DPO70000(VisaInstrument):
             docstring='''
             In each each acquisition interval, show
              * sample: the first sampled value
-             * peakdetect: the minimum and maximum samples
+             * peakdetect: the minimum and maximum sample values
              * hires: the average of all samples
              * average: the first sample averaged over separate acquisitions
+                        the instrument returns a running exponential average
              * wfmdb: a histogram of all samples of one or more acquisitions
-             * envelope: a histogram of the minimum and maximum samples of 
-                         multiple acquisitions
+             * envelope: the minimum and maximum sample values of multiple 
+                         acquisitions
             ''',
             get_cmd='ACQ:MODE?', set_cmd='ACQ:MODE {}',
             val_mapping={'sample':'SAM', 'peakdetect':'PEAK', 'hires':'HIR',
                          'average':'AVE', 'wfmdb':'WFMDB', 'envelope':'ENV'}
+        )
+        #self.add_parameter(
+        #    'acq_mode_actual', label='Actual Acquisition Mode',
+        #    get_cmd='ACQ:MODE:ACTUAL?'
+        #)
+        self.add_parameter(
+            'acq_numacq', label='Number of acquisitions', 
+            docstring='Total number of acquisitions since last run command.'
+                      'Counting stops when 2^30-1 is reached.', 
+            get_cmd='ACQ:NUMACQ?', get_parser=int
         )
         self.add_parameter(
             'acq_fast', label='Fast acquisitions',
@@ -504,23 +535,24 @@ class Tektronix_DPO70000(VisaInstrument):
             Staus of fast acquisitions.
             Fast acquisitions always use acq_mode==sample.
             ''', 
-            get_cmd='FASTACQ:STATE?', get_parser=lambda v: bool(int(v)),
+            get_cmd='FASTACQ:STATE?', get_parser=ibool,
             set_cmd='FASTACQ:STATE {:d}; HIACQRATE 1', vals=vals.Bool()
         )
         self.add_parameter(
             'acq_averages', label='Number of averages',
             get_cmd='ACQ:NUMAVG?', get_parser=int,
-            set_cmd='ACQ:NUMAVG {:d}', vals=vals.Numbers(1)
+            set_cmd='ACQ:NUMAVG {:d}', vals=vals.Ints(1)
         )
         self.add_parameter(
             'acq_envelopes', label='Number of envelope waveforms',
             get_cmd='ACQ:NUMENV?', get_parser=int,
-            set_cmd='ACQ:NUMENV {:d}', vals=vals.Numbers(1, 2e9)
+            set_cmd='ACQ:NUMENV {:d}', vals=vals.Ints(1, 2000000000)
         )
         self.add_parameter(
-            'acq_wfmdbs', label='Number of wfmdb waveforms',
+            'acq_wfmdbs', label='Number of wfmdb samples',
+            docstring='Total number of counts in the WFMDB pixmap.',
             get_cmd='ACQ:NUMSAMPLES?', get_parser=int,
-            set_cmd='ACQ:NUMSAMPLES {:d}', vals=vals.Numbers(5000, 2147400000)
+            set_cmd='ACQ:NUMSAMPLES {:d}', vals=vals.Ints(5000, 2147400000)
         )
         self.add_parameter(
             'acq_sampling', label='Sampling mode', 
@@ -562,7 +594,7 @@ class Tektronix_DPO70000(VisaInstrument):
         )
         self.add_parameter(
             'hdelay_status', label='Horizontal Delay Status',
-            get_cmd='HOR:DELAY:MODE?', get_parser=lambda v: bool(int(v)),
+            get_cmd='HOR:DELAY:MODE?', get_parser=ibool,
             set_cmd='HOR:DELAY:MODE {:d}', vals=vals.Bool()
         )
         self.add_parameter(
@@ -580,23 +612,40 @@ class Tektronix_DPO70000(VisaInstrument):
         # Fast frame setup
         self.add_parameter(
             'frame_state', label='Fast frame acquisition state',
-            get_cmd='HOR:FAST:STATE?', get_parser=lambda v: bool(int(v)),
+            get_cmd='HOR:FAST:STATE?', get_parser=ibool,
             set_cmd='HOR:FAST:STATE {:d}', vals=vals.Bool()
         )
         self.add_parameter(
             'frame_count', label='Fast frame count',
             get_cmd='HOR:FAST:COUNT?', get_parser=int,
-            set_cmd='HOR:FAST:COUNT {:d}', vals=vals.Numbers(1)
+            set_cmd='HOR:FAST:COUNT {:d}', vals=vals.Ints(1)
         )
         self.add_parameter(
-            'frame_max', label='Fast frame maximum count',
+            'frame_maxcount', label='Fast frame maximum count',
             get_cmd='HOR:FAST:MAXFRAMES?', get_parser=int
         )
         self.add_parameter(
             'frame_seqstop', label='Fast frame sequence stop condition',
+            docstring='Fast frame single-sequence mode stop condition. '
+                      'Stops after N frames in `single`, manually otherwise.', 
             get_cmd='HOR:FAST:SEQ?', set_cmd='HOR:FAST:SEQ {}',
             val_mapping={'single': 'FIR', 'manual':'LAST'}
         )
+        self.add_parameter(
+            'frame_numacq', label='Fast frame number of frames acquired',
+            get_cmd='ACQ:NUMFRAMESACQUIRED?', get_parser=int
+        )
+        self.add_parameter(
+            'frame_sumframe', label='Fast frame summary frame', 
+            get_cmd='HOR:FAST:SUMFRAME?', set_cmd='HOR:FAST:SUMFRAME {}', 
+            val_mapping={'none': 'NON', 'average':'AVE', 'envelope':'ENV'}
+        )
+        #self.add_parameter(
+        #    'frame_16bit', label='Fast frame 16bit mode',
+        #    docstring='If True, the averaged summary frame has 16bit resolution.', 
+        #    get_cmd='HOR:FAST:SIXTEENBIT?', get_parser=ibool, 
+        #    set_cmd='HOR:FAST:SIXTEENBIT {:d}', vals=vals.Bool()
+        #)
 
         # Triggers
         self.add_submodule('triggerA', DPOTrigger(self, 'triggerA', 'A'))
@@ -609,12 +658,60 @@ class Tektronix_DPO70000(VisaInstrument):
             self.add_submodule(ch, DPOMathChannel(self, ch, ch.upper()))
         for ch in ['ref1', 'ref2', 'ref3', 'ref4']:
             self.add_submodule(ch, DPOReferenceChannel(self, ch, ch.upper()))
+        self.add_submodule('auxin', DPOAuxiliaryChannel(self, 'auxin', 'AUXIN'))
+
+        # *IDN?
+        self.connect_message()
 
     def autoset(self):
         self.write('AUTOSET')
 
     def clear(self):
+        '''Clear all acquisitions, measurements and waveforms.'''
         self.write('CLEAR')
 
+    def run(self):
+        '''Start acquisition in continuous (run/stop) mode.'''
+        self.acq_single.set(False)
+        self.acq_state.set(True)
+
+    def single(self, wait=True, timeout=None):
+        '''Start acquisition in single mode. Optionally call wait().'''
+        self.acq_single.set(True)
+        self.acq_state.set(True)
+        if wait:
+            return self.wait(timeout)
+
+    def start(self):
+        '''Start acquisition in current mode.'''
+        self.acq_state.set(True)
+
+    def stop(self):
+        '''Stop acquisition.'''
+        self.acq_state.set(False)
+
     def trigger(self):
+        '''Force a trigger event.'''
         self.write('TRIGGER')
+
+    def wait(self, timeout=None, delay=10e-3):
+        '''
+        Wait for acquisition to finish. Requires single acquisition mode.
+
+        Input
+        -----
+        timeout: `float`, default self.timeout()
+            Maximum time to wait.
+
+        Return
+        ------
+        True if acquisition finished before the timeout, False otherwise.
+        '''
+        if timeout is None:
+            timeout = self.timeout.get()
+        max_time = time.time() + timeout
+        while (time.time() < max_time):
+            if not self.acq_state():
+                return True
+            time.sleep(delay)
+        return False
