@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 from qcodes import (
-    ArrayParameter, InstrumentChannel, VisaInstrument, validators as vals,
+    MultiParameter, InstrumentChannel, VisaInstrument, validators as vals,
     DataArray
 )
 
@@ -14,7 +14,7 @@ def ibool(v):
     '''convert str -> int -> bool'''
     return bool(int(v))
 
-class DPOCurve(ArrayParameter):
+class DPOCurve(MultiParameter):
     def __init__(self, name, source, command='CURVE', **kwargs):
         '''
         Input
@@ -32,7 +32,7 @@ class DPOCurve(ArrayParameter):
         * Point format can be Y or ENVelope. ENVelope should be returned as a
           MultiParameter with min and max arrays instead.
         '''
-        super().__init__(name, shape=(), **kwargs)
+        super().__init__(name, names=(name,), shapes=((),), **kwargs)
         self.source = source
         self.command = command
 
@@ -45,12 +45,13 @@ class DPOCurve(ArrayParameter):
             ('BYT_OR', str), ('WFID', qstr), ('NR_PT', int), ('PT_FMT', str),
             ('XUNIT', qstr), ('XINCR', float), ('XZERO', float), ('PT_OFF', int), 
             ('YUNIT', qstr), ('YMULT', float), ('YOFF', float), ('YZERO', float), 
-            ('NR_FR', int), ('PT_OR', str), ('FASTFRAME', int), ('SUMFRAME', str)
+            ('NR_FR', int), ('PT_OR', str), ('ACQLEN', int), ('FASTFRAME', ibool), 
+            ('SUMFRAME', str)
         ]))
         preamble_vals = self._instrument.ask(
             ':DATA:SOURCE {}; '.format(self.source) + 
             ':WFMO?; :WFMO:PT_OR?; '
-            ':HOR:FAST:STATE?; SUMFRAME?'
+            ':HOR:ACQLENGTH?; :HOR:FAST:STATE?; SUMFRAME?'
         )
         preamble = dict((key, parser(value)) for value, key, parser 
                         in zip(preamble_vals.split(';'), *preamble_keys_parsers))
@@ -82,28 +83,44 @@ class DPOCurve(ArrayParameter):
     def _update(self, pre):
         '''Update shape, label unit and setpoints from the waveform preamble.'''
         # determine label and data unit
-        self.label = pre['WFID']
-        self.unit = pre['YUNIT']
+        # if the point format is ENVelope, the resolution is halved and the 
+        # raw data alternate between min and max for each sampling interval
+        if pre['PT_FMT'] == 'ENV':
+            self.names = ('min', 'max')
+            self.labels = ('{}, minimum'.format(pre['WFID']),
+                           '{}, maximum'.format(pre['WFID']))
+            noutputs = 2
+        else:
+            self.names = (self.name,)
+            self.labels = (pre['WFID'],)
+            noutputs = 1
+        self.units = (pre['YUNIT'],)*noutputs
         # determine setpoints
-        npoints = 1000 if pre['PIXMAP'] else pre['NR_PT']
+        if pre['PIXMAP']:
+            npoints = 1000
+            ptoffset = pre['PT_OFF'] * pre['ACQLEN'] // npoints
+        else:
+            npoints = pre['NR_PT'] // noutputs
+            ptoffset = pre['PT_OFF'] // noutputs
         sp_times = DataArray(
             name='X', unit=pre['XUNIT'], is_setpoint=True, 
-            preset_data=pre['XZERO'] + pre['XINCR']*np.arange(npoints)
+            preset_data=(pre['XINCR']*noutputs*np.arange(-ptoffset, npoints-ptoffset) +
+                         pre['XZERO'])
         )
         if not pre['FASTFRAME']:
             # output is 1d if FastFrame is disabled
-            self.shape = (npoints,)
-            self.setpoints = (sp_times,)
+            self.shapes = ((npoints,),)*noutputs
+            self.setpoints = ((sp_times,),)*noutputs
         else:
             # output is 2d if FastFrame is enabled
             nframes = pre['NR_FR']
-            self.shape = (nframes, npoints)
+            self.shapes = ((nframes, npoints),)*noutputs
             sp_frames = DataArray(
                 name='frame', unit='', is_setpoint=True, 
                 preset_data=np.arange(nframes)
             )
             sp_times.nest(len(sp_frames))
-            self.setpoints = (sp_frames, sp_times)
+            self.setpoints = ((sp_frames, sp_times),)*noutputs
 
     def prepare(self, data_start=1, data_stop=(1<<31)-1, frame_start=1, 
                 frame_stop=(1<<31)-1):
@@ -191,8 +208,12 @@ class DPOCurve(ArrayParameter):
             else:
                 # in all other modes shift and scale the data
                 data = pre['YZERO'] + pre['YMULT']*data.astype(np.float32)
-        data.shape = self.shape
-        return data
+            if pre['PT_FMT'] == 'ENV':
+                # in envelope mode, return min and max separately
+                return tuple(data[offset::2].reshape(shape)
+                             for offset, shape in enumerate(self.shapes))
+        data.shape = self.shapes[0]
+        return (data,)
 
 
 class DPOPixmap(DPOCurve):
@@ -218,9 +239,9 @@ class DPOPixmap(DPOCurve):
         columns = 1000
         if pre['NR_PT'] != rows*columns:
             raise ValueError('Pixmap size is not equal to rows*columns.')
-        self.shape = (columns, rows)
-        self.label = pre['WFID']
-        self.unit = ''
+        self.shapes = ((columns, rows),)
+        self.labels = (pre['WFID'],)
+        self.units = ('',)
         # determine setpoints
         sp_xs = DataArray(
             name='X', unit=pre['XUNIT'], is_setpoint=True, 
@@ -231,7 +252,7 @@ class DPOPixmap(DPOCurve):
             preset_data=pre['YZERO'] + pre['YMULT']*(np.arange(rows)-pre['YOFF'])
         )
         sp_ys.nest(len(sp_xs))
-        self.setpoints = (sp_xs, sp_ys)
+        self.setpoints = ((sp_xs, sp_ys),)
 
     def get_raw(self):
         return super().get_raw(raw=True)
@@ -694,7 +715,7 @@ class Tektronix_DPO70000(VisaInstrument):
         '''Force a trigger event.'''
         self.write('TRIGGER')
 
-    def wait(self, timeout=None, delay=10e-3):
+    def wait(self, timeout=None):
         '''
         Wait for acquisition to finish. Requires single acquisition mode.
 
@@ -713,5 +734,4 @@ class Tektronix_DPO70000(VisaInstrument):
         while (time.time() < max_time):
             if not self.acq_state():
                 return True
-            time.sleep(delay)
         return False
